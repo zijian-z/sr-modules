@@ -1,10 +1,11 @@
 (() => {
   const DEFAULT_TARGET_LANGUAGE = "zh-CN";
   const SEPARATOR = "\n|||\n";
-  const CHUNK_CHAR_LIMIT = 1100;
-  const REQUEST_TIMEOUT = 10;
+  const CHUNK_CHAR_LIMIT = 1600;
+  const REQUEST_TIMEOUT = 6;
+  const MAX_CONCURRENT = 2;
 
-  // 读取模块参数：翻译目标语言
+  // 读取模块参数：翻译目标语言|调试通知
   const args = typeof $argument === "string" ? $argument.split("|") : [];
 
   const targetLanguage = (args[0] || "").trim();
@@ -12,6 +13,9 @@
     /^[a-zA-Z0-9-]+$/.test(targetLanguage)
       ? targetLanguage
       : DEFAULT_TARGET_LANGUAGE;
+
+  const debugArg = (args[1] || "").trim().toLowerCase();
+  const DEBUG = debugArg === "开" || debugArg === "on";
 
   // 根据目标语言显示对应的地区旗帜
   const LANGUAGE_FLAGS = {
@@ -175,6 +179,7 @@
 
   const results = new Array(chunks.length).fill(null);
   let remaining = chunks.length;
+  const failReasons = [];
 
   // Google 翻译有多个等价入口，被风控(302/sorry)时自动换下一个
   const TRANSLATE_HOSTS = [
@@ -183,8 +188,38 @@
     "translate.googleapis.com"
   ];
 
+  const notify = (translatedCount) => {
+    if (
+      typeof $notification === "undefined" ||
+      !$notification.post
+    ) {
+      return;
+    }
+
+    const failedChunks = results.filter((r) => !r).length;
+    const totalFail = translatedCount === 0;
+
+    // 非调试模式下只在全军覆没时打扰
+    if (!DEBUG && !totalFail) {
+      return;
+    }
+
+    const reason =
+      failReasons.length > 0
+        ? failReasons.slice(0, 2).join("；")
+        : "翻译响应结构异常";
+
+    $notification.post(
+      totalFail ? "🆆🆂🅹 翻译失败" : "🆆🆂🅹 翻译调试",
+      `已译 ${translatedCount}/${targets.length} 段，失败分块 ${failedChunks}/${chunks.length}`,
+      reason
+    );
+  };
+
   const finish = () => {
     try {
+      let translatedCount = 0;
+
       chunks.forEach((chunk, chunkIndex) => {
         const raw = results[chunkIndex];
 
@@ -204,6 +239,9 @@
 
         // 分隔后的段落数量对不上就放弃这一块，避免错位
         if (translatedParts.length !== chunk.length) {
+          failReasons.push(
+            `块${chunkIndex + 1}: 段落数不匹配`
+          );
           return;
         }
 
@@ -223,8 +261,11 @@
             node === headline ? `${TRANSLATE_FLAG} ` : "";
 
           node.text = `${node.text}\n${prefix}${translatedText}`;
+          translatedCount += 1;
         });
       });
+
+      notify(translatedCount);
 
       return $done({
         body: JSON.stringify(data)
@@ -271,9 +312,17 @@
           return requestChunk(chunkIndex, hostIndex + 1);
         } else {
           results[chunkIndex] = null;
+          failReasons.push(
+            `块${chunkIndex + 1}: ` +
+              (error
+                ? "网络错误/超时"
+                : `HTTP ${response ? response.status : "?"}`)
+          );
         }
 
         remaining -= 1;
+        active -= 1;
+        pump();
 
         if (remaining === 0) {
           finish();
@@ -282,7 +331,17 @@
     );
   };
 
-  chunks.forEach((_, chunkIndex) => {
-    requestChunk(chunkIndex, 0);
-  });
+  // 限制并发，避免突发请求触发 Google 风控
+  let nextChunk = 0;
+  let active = 0;
+
+  const pump = () => {
+    while (active < MAX_CONCURRENT && nextChunk < chunks.length) {
+      active += 1;
+      requestChunk(nextChunk, 0);
+      nextChunk += 1;
+    }
+  };
+
+  pump();
 })();
