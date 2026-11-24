@@ -41,10 +41,37 @@
 
   const TRANSLATE_FLAG = LANGUAGE_FLAGS[TARGET_LANGUAGE] || "🌐";
 
+  const path =
+    typeof $request !== "undefined" && typeof $request.url === "string"
+      ? $request.url.replace(/^https?:\/\/[^/]+/, "").split("?")[0]
+      : "";
+
+  const report = (message, detail) => {
+    const title = "知乎翻译 · " + message;
+    const endpoint = path || "未知接口";
+    console.log(title + " " + endpoint + " " + detail);
+
+    if (typeof $notification !== "undefined" &&
+        typeof $notification.post === "function") {
+      $notification.post(title, endpoint, detail);
+    }
+  };
+
+  const skip = (reason) => {
+    if (DEBUG) {
+      report("跳过", reason);
+    }
+    return $done({});
+  };
+
+  if (DEBUG) {
+    report("脚本已触发", "正在检查响应正文");
+  }
+
   const body = $response.body;
 
   if (!body) {
-    return $done({});
+    return skip("Shadowrocket 没有传入响应正文");
   }
 
   let data;
@@ -52,7 +79,7 @@
   try {
     data = JSON.parse(body);
   } catch (err) {
-    return $done({});
+    return skip("知乎响应正文无法解析为 JSON");
   }
 
   // 含至少 2 个汉字就翻译（知乎大量中英混排段落）
@@ -63,7 +90,17 @@
 
   // 收集翻译目标：正文段落节点（{text, marks, pid}）与问题标题
   const paragraphNodes = [];
-  const titleNodes = [];
+  const titleNodes = new Set();
+  const addTitle = (node) => {
+    if (node && isChinese(node.title)) {
+      titleNodes.add(node);
+    }
+  };
+
+  if (/^\/(?:v\d+\/)?questions\/\d+\/?$/.test(path)) {
+    addTitle(data);
+    addTitle(data && data.data);
+  }
 
   const walk = (obj) => {
     if (!obj || typeof obj !== "object") {
@@ -73,6 +110,10 @@
     if (Array.isArray(obj)) {
       obj.forEach(walk);
       return;
+    }
+
+    if (obj.type === "question") {
+      addTitle(obj);
     }
 
     for (const key of Object.keys(obj)) {
@@ -86,10 +127,8 @@
       ) {
         collectSegments(value);
       } else if (key === "question" && value && typeof value === "object") {
-        if (isChinese(value.title)) {
-          titleNodes.push(value);
-        }
-        // 问题补充说明是 HTML，暂不处理
+        addTitle(value);
+        walk(value);
       } else {
         walk(value);
       }
@@ -109,7 +148,6 @@
       if (
         paragraph &&
         typeof paragraph === "object" &&
-        Array.isArray(paragraph.marks) &&
         isChinese(paragraph.text)
       ) {
         paragraphNodes.push(paragraph);
@@ -120,21 +158,21 @@
   walk(data);
 
   // 标题在前（带旗帜），段落在后
-  const targets = titleNodes.concat(paragraphNodes);
+  const targets = [...titleNodes, ...paragraphNodes];
 
   if (targets.length === 0) {
-    return $done({});
+    return skip("JSON 里未找到符合条件的问题标题或中文正文段落");
   }
 
   // 标题节点文本在 .title，正文段落节点文本在 .text
   const getText = (node) =>
-    node.text !== undefined ? node.text : node.title;
+    titleNodes.has(node) ? node.title : node.text;
 
   const setText = (node, value) => {
-    if (node.text !== undefined) {
-      node.text = value;
-    } else {
+    if (titleNodes.has(node)) {
       node.title = value;
+    } else {
+      node.text = value;
     }
   };
 
@@ -174,92 +212,60 @@
     "translate.googleapis.com"
   ];
 
-  const notify = (translatedCount) => {
-    if (
-      typeof $notification === "undefined" ||
-      !$notification.post
-    ) {
-      return;
+  const splitTranslation = (body, expectedCount) => {
+    let response;
+
+    try {
+      response = JSON.parse(body);
+    } catch (err) {
+      return null;
     }
 
-    const failedChunks = results.filter((r) => !r).length;
-    const totalFail = translatedCount === 0;
-
-    if (!DEBUG && !totalFail) {
-      return;
+    if (!Array.isArray(response) || !Array.isArray(response[0])) {
+      return null;
     }
 
-    const reason =
-      failReasons.length > 0
-        ? failReasons.slice(0, 2).join("；")
-        : "翻译响应结构异常";
+    const combined = response[0]
+      .map((item) => (Array.isArray(item) && typeof item[0] === "string" ? item[0] : ""))
+      .join("");
 
-    $notification.post(
-      totalFail ? "知乎 翻译失败" : "知乎 翻译调试",
-      `已译 ${translatedCount}/${targets.length} 段，失败分块 ${failedChunks}/${chunks.length}`,
-      reason
-    );
+    const parts = combined.split(/\s*\|\|\|\s*/).map((part) => part.trim());
+    return parts.length === expectedCount && parts.every(Boolean) ? parts : null;
   };
 
   const finish = () => {
-    try {
-      let translatedCount = 0;
+    let translatedCount = 0;
 
-      chunks.forEach((chunk, chunkIndex) => {
-        const raw = results[chunkIndex];
+    chunks.forEach((chunk, chunkIndex) => {
+      const parts = results[chunkIndex];
+      if (!parts) {
+        return;
+      }
 
-        if (!raw) {
+      chunk.forEach((node, nodeIndex) => {
+        const original = getText(node);
+        const translated = parts[nodeIndex];
+        if (translated === original.trim()) {
           return;
         }
 
-        const res = JSON.parse(raw);
-
-        const translatedCombined = (res[0] || [])
-          .map((item) => (item && item[0] ? item[0] : ""))
-          .join("");
-
-        const translatedParts = translatedCombined.split(
-          /\n\s*\|\|\|\s*\n/
-        );
-
-        // 分隔后的段落数量对不上就放弃这一块，避免错位
-        if (translatedParts.length !== chunk.length) {
-          failReasons.push(
-            `块${chunkIndex + 1}: 段落数不匹配`
-          );
-          return;
-        }
-
-        chunk.forEach((node, nodeIndex) => {
-          const translatedText =
-            (translatedParts[nodeIndex] || "").trim();
-
-          if (
-            !translatedText ||
-            translatedText === getText(node).trim()
-          ) {
-            return;
-          }
-
-          // 标题译文带旗帜，正文段落只追加译文
-          const prefix =
-            titleNodes.indexOf(node) !== -1
-              ? `${TRANSLATE_FLAG} `
-              : "";
-
-          setText(node, `${getText(node)}\n${prefix}${translatedText}`);
-          translatedCount += 1;
-        });
+        const prefix = titleNodes.has(node) ? TRANSLATE_FLAG + " " : "";
+        setText(node, original + "\n" + prefix + translated);
+        translatedCount += 1;
       });
+    });
 
-      notify(translatedCount);
-
-      return $done({
-        body: JSON.stringify(data)
-      });
-    } catch (err) {
-      return $done({});
+    if (DEBUG || translatedCount === 0) {
+      const detail = ["已译 " + translatedCount + "/" + targets.length + " 段"];
+      if (failReasons.length) {
+        detail.push(...failReasons.slice(0, 2));
+      } else if (translatedCount === 0) {
+        detail.push("Google 返回的文本与原文相同");
+      }
+      report(translatedCount ? "翻译结束" : "翻译失败", detail.join("；"));
     }
+
+    return $done(translatedCount ? { body: JSON.stringify(data) } : {});
   };
 
   const requestChunk = (chunkIndex, hostIndex) => {
@@ -287,32 +293,30 @@
         timeout: REQUEST_TIMEOUT * 1000
       },
       function (error, response, responseData) {
-        if (
-          !error &&
-          response &&
-          response.status === 200 &&
-          responseData
-        ) {
-          results[chunkIndex] = responseData;
+        const status = response && (response.status || response.statusCode);
+        const parts = !error && status === 200
+          ? splitTranslation(responseData, chunk.length)
+          : null;
+
+        if (parts) {
+          results[chunkIndex] = parts;
         } else if (hostIndex + 1 < TRANSLATE_HOSTS.length) {
-          // 当前主机失败（被风控返回 302 等），换下一个入口重试
           return requestChunk(chunkIndex, hostIndex + 1);
         } else {
-          results[chunkIndex] = null;
-          failReasons.push(
-            `块${chunkIndex + 1}: ` +
-              (error
-                ? "网络错误/超时"
-                : `HTTP ${response ? response.status : "?"}`)
-          );
+          const reason = error
+            ? "网络错误或超时"
+            : status === 200
+              ? "Google 响应格式或段落数不匹配"
+              : "Google HTTP " + (status || "未知");
+          failReasons.push("第 " + (chunkIndex + 1) + " 批：" + reason);
         }
 
         remaining -= 1;
         active -= 1;
-        pump();
-
         if (remaining === 0) {
           finish();
+        } else {
+          pump();
         }
       }
     );
@@ -325,8 +329,9 @@
   const pump = () => {
     while (active < MAX_CONCURRENT && nextChunk < chunks.length) {
       active += 1;
-      requestChunk(nextChunk, 0);
+      const chunkIndex = nextChunk;
       nextChunk += 1;
+      requestChunk(chunkIndex, 0);
     }
   };
 
