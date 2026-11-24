@@ -1,0 +1,5 @@
+# 抓包数据（含账号凭证，绝不能提交）
+capture/
+*.flows
+
+.DS_Store
