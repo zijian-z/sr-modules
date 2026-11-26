@@ -9,7 +9,7 @@
 在 WSJ iOS App 的原生文章页阅读英文。GLM-5.3-Flash 只在少量有阅读难点的段落后加「英语笔记」，解释词组在文中的含义，必要时拆解长句。比如 `price in＝提前反映在价格里`。
 
 - [安装 WSJ AI 英语精读](https://raw.githubusercontent.com/zijian-z/sr-modules/main/wsj-ai-reading/WSJ-AI-Reading.conf)
-- 在 Shadowrocket 打开「配置 → 模块 → WSJ AI 英语精读 → 编辑参数」，填写 `ZAI_API_KEY`。
+- 在 Shadowrocket 打开「配置 → 模块 → WSJ AI 英语精读 → 编辑参数」，填写 `ZAI_API_KEY`。脚本会清理粘贴时附带的首尾空白和零宽空格。
 - 需开启 HTTPS 解密并信任根证书。与下方 Google 模块拦截同一文章接口，启用其中一个即可。已读文章可能命中 App 缓存，首次验证可打开一篇未读文章。
 - 每篇文章发起一次 Z.AI 通用 API 请求，发送的内容仅包括标题、副标题和正文中的文本，长度有上限（约 16,000 个字符）。调用需要账户开通 `GLM-5.3-Flash` 通用 API 并有可用余额或资源包。[Coding Plan 额度仅适用于 Z.AI 官方支持的工具](https://docs.z.ai/legal-agreement/subscription-terms)，无法用于此模块。
 - 缺少 Key、请求失败或超时时，WSJ 会照常显示英文原文。相同错误在 1 分钟内只提示一次。需要确认脚本是否触发时，可以把「调试通知」设为「开」。

@@ -8,7 +8,8 @@
   const NOTE_MARKER = "\n〔英语笔记〕";
 
   const args = typeof $argument === "string" ? $argument.split("|") : [];
-  const apiKey = (args[0] || "").trim();
+  // Pasting a key can add whitespace or an invisible zero-width space.
+  const apiKey = (args[0] || "").replace(/^[\s\u200B]+|[\s\u200B]+$/g, "");
   const debug = /^(开|on)$/i.test((args[1] || "").trim());
 
   function notify(title, message) {
