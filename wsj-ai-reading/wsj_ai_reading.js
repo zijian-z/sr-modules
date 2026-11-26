@@ -3,6 +3,8 @@
   const MODEL = "glm-5.3-flash";
   const REQUEST_DEADLINE_MS = 28000;
   const MAX_INPUT_CHARS = 16000;
+  const ERROR_NOTICE_INTERVAL_MS = 60000;
+  const ERROR_NOTICE_STORE_KEY = "wsj.ai-reading.last-error-notice";
   const NOTE_MARKER = "\n〔英语笔记〕";
 
   const args = typeof $argument === "string" ? $argument.split("|") : [];
@@ -13,6 +15,51 @@
     if (typeof $notification !== "undefined" && $notification.post) {
       $notification.post("WSJ AI 英语精读", title, message);
     }
+  }
+
+  function notifyError(title, message) {
+    if (typeof $persistentStore !== "undefined") {
+      try {
+        const now = Date.now();
+        const previous = JSON.parse($persistentStore.read(ERROR_NOTICE_STORE_KEY) || "null");
+        if (previous && previous.message === message &&
+            now >= previous.time && now - previous.time < ERROR_NOTICE_INTERVAL_MS) {
+          return;
+        }
+        $persistentStore.write(JSON.stringify({ time: now, message }), ERROR_NOTICE_STORE_KEY);
+      } catch (error) {
+        // Notification still works when persistent storage is unavailable.
+      }
+    }
+    notify(title, message);
+  }
+
+  function describeApiError(status, raw) {
+    let code;
+    try {
+      const data = JSON.parse(raw);
+      const value = data && data.error && data.error.code;
+      if (/^\d{4}$/.test(String(value))) {
+        code = String(value);
+      }
+    } catch (error) {
+      // Some upstream errors only contain an HTTP status.
+    }
+
+    const label = "Z.AI HTTP " + (status || "未知") + (code ? " / " + code : "") + "。";
+    if (code === "1113") {
+      return label + "通用 API 余额或资源包不足。Coding Plan 额度不能用于此模块。";
+    }
+    if (code === "1315") {
+      return label + "此 Key 限用 Coding Plan，请填写具备通用 API 权限的 Key。";
+    }
+    if (code === "1302" || code === "1305") {
+      return label + "请求频率受限或服务暂时繁忙，请稍后再打开文章。";
+    }
+    if (status === 429) {
+      return label + "请检查通用 API 额度或限流情况。Coding Plan 额度不能用于此模块。";
+    }
+    return label + "请检查 Key 和 GLM-5.3-Flash 的通用 API 权限。";
   }
 
   let data;
@@ -60,7 +107,7 @@
   }
 
   if (!/^[A-Za-z0-9._-]+$/.test(apiKey)) {
-    notify("需要 Z.AI API Key", "在 Shadowrocket 的模块参数中填写 ZAI_API_KEY。");
+    notifyError("需要 Z.AI API Key", "在 Shadowrocket 的模块参数中填写 ZAI_API_KEY。");
     return $done({});
   }
 
@@ -168,7 +215,7 @@
     clearTimeout(deadline);
 
     if (error) {
-      notify("生成注释失败", error);
+      notifyError("生成注释失败", error);
     } else if (debug) {
       notify("生成 " + count + " 条注释", "已检查 " + paragraphs.length + " 段英文。");
     }
@@ -204,7 +251,7 @@
 
       const status = Number(response.status || response.statusCode);
       if (status !== 200) {
-        return finish("Z.AI 返回 HTTP " + (status || "未知") + "，请检查 Key、额度和模型权限。", 0);
+        return finish(describeApiError(status, raw), 0);
       }
 
       let count;
