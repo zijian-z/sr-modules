@@ -4,20 +4,15 @@
 
 ## 模块列表
 
-### 🅉🅷🅸🅷🆄 知乎自动翻译（中文转外语）
+### WSJ AI 英语精读
 
-为知乎 iOS App 生成中英（或其他语言）双语对照：问题标题与回答正文逐段追加 Google 翻译译文，默认中文转英文。
+在 WSJ iOS App 的原生文章页阅读英文。GLM-5.3-Flash 只在少量有阅读难点的段落后加「英语笔记」，解释词组在文中的含义，必要时拆解长句。比如 `price in＝提前反映在价格里`。
 
-- 安装地址：
-  ```
-  https://raw.githubusercontent.com/zijian-z/sr-modules/main/zhihu-translate/ZHIHU.conf
-  ```
-- 覆盖接口：回答详情（`answers/v2`）、推荐流展开（`next-render`）、问题详情、回答列表（问题标题）
-- 正文取自 `structured_content.segments[].paragraph.text`（只追加不改原文，marks 富文本标记不受影响）
-- 含至少 2 个汉字的段落才翻译，中英混排也能覆盖
-- 依赖：MITM 开启并信任根证书；拒掉 `api.zhihu.com` 的 QUIC 强制走 TCP
-- 暂不支持：专栏文章（未抓包分析）、问题补充说明（HTML 格式）、回答列表里的内容摘要（excerpt）
-- 翻译失败会弹系统通知（完全失败必弹；调试模式每次都弹），三域名自动降级
+- [安装 WSJ AI 英语精读](https://raw.githubusercontent.com/zijian-z/sr-modules/main/wsj-ai-reading/WSJ-AI-Reading.conf)
+- 在 Shadowrocket 打开「配置 → 模块 → WSJ AI 英语精读 → 编辑参数」，填写 `ZAI_API_KEY`。
+- 需开启 HTTPS 解密并信任根证书。与下方 Google 模块拦截同一文章接口，启用其中一个即可。已读文章可能命中 App 缓存，首次验证可打开一篇未读文章。
+- 每篇文章发起一次 Z.AI 通用 API 请求，发送的内容仅包括标题、副标题和正文中的文本，长度有上限（约 16,000 个字符）。调用使用账户的通用 API 余额或资源包。
+- 缺少 Key、请求失败或超时时，WSJ 会照常显示英文原文。需要确认脚本是否触发时，可以把「调试通知」设为「开」。
 
 ### 🆆🆂🅹 WSJ 自动翻译
 
@@ -38,12 +33,12 @@
 ```
 sr-modules/
 ├── README.md
-├── wsj-translate/
-│   ├── WSJ.conf          # 模块配置
-│   └── wsj_translate.js  # 翻译脚本
-└── zhihu-translate/
-    ├── ZHIHU.conf
-    └── zhihu_translate.js
+├── wsj-ai-reading/
+│   ├── WSJ-AI-Reading.conf
+│   └── wsj_ai_reading.js
+└── wsj-translate/
+    ├── WSJ.conf
+    └── wsj_translate.js
 ```
 
 新增模块时：新建 `<模块名>/` 目录，放入 `.conf` 与脚本，脚本地址引用本仓库 raw 链接，并更新本 README。
