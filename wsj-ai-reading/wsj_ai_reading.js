@@ -3,6 +3,10 @@
   const MODEL = "glm-5.3-flash";
   const REQUEST_DEADLINE_MS = 28000;
   const MAX_INPUT_CHARS = 16000;
+  const REQUEST_STATE_KEY = "wsj.ai-reading.request-state.v1";
+  const CACHE_TTL_MS = 15 * 60000;
+  const RATE_LIMIT_PAUSE_MS = 30000;
+  const RESULT_POLL_MS = 250;
   const ERROR_NOTICE_INTERVAL_MS = 60000;
   const ERROR_NOTICE_STORE_KEY = "wsj.ai-reading.last-error-notice";
   const NOTE_MARKER = "\n〔英语笔记〕";
@@ -127,6 +131,8 @@
     return $done({});
   }
 
+  const articleText = JSON.stringify(paragraphs);
+  const articleId = fingerprint(articleText);
   const maxNotes = Math.min(12, Math.ceil(paragraphs.length / 2));
   const submittedIds = new Set(paragraphs.map((paragraph) => paragraph.id));
   const prompt = [
@@ -171,7 +177,7 @@
     return parts.join(" · ");
   }
 
-  function applyNotes(raw) {
+  function readNotes(raw) {
     const result = JSON.parse(raw);
     const choice = result.choices && result.choices[0];
     if (!choice || choice.finish_reason !== "stop" || !choice.message) {
@@ -183,48 +189,161 @@
       throw new Error("Invalid notes");
     }
 
-    const annotatedIds = new Set();
+    const notes = new Map();
     for (const note of output.notes) {
-      if (annotatedIds.size >= maxNotes) {
+      if (notes.size >= maxNotes) {
         break;
       }
-      if (!note || !submittedIds.has(note.id) || annotatedIds.has(note.id)) {
+      if (!note || !submittedIds.has(note.id) || notes.has(note.id)) {
         continue;
       }
 
       const node = targets[note.id];
       const hint = formatNote(note, cleanText(node.text));
       if (hint) {
-        // Appending preserves the offsets of links and other native decorations.
-        node.text += NOTE_MARKER + hint;
-        annotatedIds.add(note.id);
+        notes.set(note.id, hint);
       }
     }
 
-    if (output.notes.length && !annotatedIds.size) {
+    if (output.notes.length && !notes.size) {
       throw new Error("No valid notes");
     }
-    return annotatedIds.size;
+    return Array.from(notes, ([id, hint]) => ({ id, hint }));
+  }
+
+  // Identify identical model inputs without storing the full article.
+  function fingerprint(text) {
+    let first = 2166136261;
+    let second = 5381;
+    for (let i = 0; i < text.length; i += 1) {
+      const code = text.charCodeAt(i);
+      first = Math.imul(first ^ code, 16777619);
+      second = Math.imul(second, 33) ^ code;
+    }
+    return text.length + ":" + (first >>> 0) + ":" + (second >>> 0);
+  }
+
+  function readRequestState() {
+    try {
+      const state = JSON.parse($persistentStore.read(REQUEST_STATE_KEY) || "{}");
+      return state && typeof state === "object" ? state : {};
+    } catch (error) {
+      return {};
+    }
+  }
+
+  function writeRequestState(state) {
+    try {
+      return $persistentStore.write(JSON.stringify(state), REQUEST_STATE_KEY);
+    } catch (error) {
+      return false;
+    }
   }
 
   let completed = false;
-  function finish(error, count) {
+  let deadline;
+  let owner;
+  function finish({ error, notes, rateLimited = false } = {}) {
     if (completed) {
       return;
     }
     completed = true;
     clearTimeout(deadline);
 
+    if (owner) {
+      const state = readRequestState();
+      if (state.pending && state.pending.owner === owner) {
+        delete state.pending;
+        if (notes) {
+          state.cache = { articleId, notes, until: Date.now() + CACHE_TTL_MS };
+        } else if (rateLimited) {
+          state.retryAfter = Date.now() + RATE_LIMIT_PAUSE_MS;
+        }
+        writeRequestState(state);
+      }
+    }
+
     if (error) {
       notifyError("生成注释失败", error);
-    } else if (debug) {
-      notify("生成 " + count + " 条注释", "已检查 " + paragraphs.length + " 段英文。");
+    }
+
+    let count = 0;
+    if (Array.isArray(notes)) {
+      for (const note of notes) {
+        if (note && submittedIds.has(note.id) && typeof note.hint === "string") {
+          // Appending preserves the offsets of links and other native decorations.
+          targets[note.id].text += NOTE_MARKER + note.hint;
+          count += 1;
+        }
+      }
+      if (debug && owner) {
+        notify("生成 " + count + " 条注释", "已检查 " + paragraphs.length + " 段英文。");
+      }
     }
 
     return $done(count ? { body: JSON.stringify(data) } : {});
   }
 
-  const deadline = setTimeout(() => finish("Z.AI 请求超时。", 0), REQUEST_DEADLINE_MS);
+  function cachedNotes(state, now) {
+    const cache = state.cache;
+    if (cache && cache.articleId === articleId && cache.until > now && Array.isArray(cache.notes)) {
+      return cache.notes;
+    }
+    return null;
+  }
+
+  function waitForNotes(pendingOwner) {
+    if (completed) {
+      return;
+    }
+    const state = readRequestState();
+    const now = Date.now();
+    const notes = cachedNotes(state, now);
+    if (notes) {
+      return finish({ notes });
+    }
+    if (!state.pending || state.pending.owner !== pendingOwner || state.pending.until <= now) {
+      return finish();
+    }
+    setTimeout(() => waitForNotes(pendingOwner), RESULT_POLL_MS);
+  }
+
+  const now = Date.now();
+  const state = readRequestState();
+  const cached = cachedNotes(state, now);
+  if (cached) {
+    return finish({ notes: cached });
+  }
+  if (state.retryAfter > now) {
+    return finish();
+  }
+  if (state.pending && state.pending.until > now) {
+    if (state.pending.articleId !== articleId) {
+      return finish();
+    }
+    deadline = setTimeout(() => finish(), REQUEST_DEADLINE_MS);
+    return waitForNotes(state.pending.owner);
+  }
+
+  // Shadowrocket exposes read/write storage, so this lease is best-effort.
+  owner = now + ":" + Math.random();
+  state.pending = { articleId, owner, until: now + REQUEST_DEADLINE_MS };
+  if (state.cache && state.cache.until <= now) {
+    delete state.cache;
+  }
+  if (writeRequestState(state)) {
+    const claimed = readRequestState().pending;
+    if (claimed && claimed.owner !== owner) {
+      owner = undefined;
+      if (claimed.articleId !== articleId) {
+        return finish();
+      }
+      deadline = setTimeout(() => finish(), REQUEST_DEADLINE_MS);
+      return waitForNotes(claimed.owner);
+    }
+  }
+  deadline = setTimeout(() => finish({ error: "Z.AI 请求超时。" }), REQUEST_DEADLINE_MS);
+
   try {
     $httpClient.post({
       url: API_URL,
@@ -239,33 +358,35 @@
         response_format: { type: "json_object" },
         messages: [
           { role: "system", content: prompt },
-          { role: "user", content: JSON.stringify(paragraphs) }
+          { role: "user", content: articleText }
         ]
       })
     }, (error, response, raw) => {
       if (completed) {
         return;
       }
+      const status = Number(response && (response.status || response.statusCode));
+      if (status === 429) {
+        return finish({ error: describeApiError(status, raw), rateLimited: true });
+      }
       if (error || !response) {
-        return finish("无法连接 Z.AI。", 0);
+        return finish({ error: "无法连接 Z.AI。" });
       }
-
-      const status = Number(response.status || response.statusCode);
       if (status !== 200) {
-        return finish(describeApiError(status, raw), 0);
+        return finish({ error: describeApiError(status, raw) });
       }
 
-      let count;
+      let notes;
       try {
-        count = applyNotes(raw);
+        notes = readNotes(raw);
       } catch (error) {
-        return finish("Z.AI 未返回有效注释。", 0);
+        return finish({ error: "Z.AI 未返回有效注释。" });
       }
-      return finish(null, count);
+      return finish({ notes });
     });
   } catch (error) {
     if (!completed) {
-      return finish("无法发起 Z.AI 请求。", 0);
+      return finish({ error: "无法发起 Z.AI 请求。" });
     }
   }
 })();
